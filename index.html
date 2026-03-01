@@ -130,6 +130,7 @@
       <span id="progress-text">Fetching structure…</span>
       <span id="progress-count"></span>
     </div>
+    <button class="btn-secondary" id="cancel-btn" onclick="cancelFetch()" style="display:none;align-self:flex-start;">Cancel</button>
     <div id="pages-list"></div>
   </div>
 
@@ -162,7 +163,7 @@
 </div>
 
 <footer>
-  <a href="#" target="_blank">View on GitHub</a>
+  DeepWiki Exporter
 </footer>
 
 <script>
@@ -175,6 +176,7 @@ const PROXIES = [
 
 let collectedMarkdown = '';
 let repoLabel = '';
+let currentAbortController = null;
 
 function showError(msg) {
   const el = document.getElementById('error-msg');
@@ -190,6 +192,7 @@ function reset() {
   document.getElementById('progress-area').style.display = 'none';
   document.getElementById('result-area').style.display = 'none';
   document.getElementById('pages-list').innerHTML = '';
+  document.getElementById('cancel-btn').style.display = 'none';
   hideError();
   document.getElementById('fetch-btn').disabled = false;
   collectedMarkdown = '';
@@ -199,21 +202,26 @@ function parseRepoFromUrl(rawUrl) {
   rawUrl = rawUrl.trim().replace(/\/$/, '');
   const m = rawUrl.match(/deepwiki\.com\/([^/]+\/[^/]+)/);
   if (m) return m[1];
-  const parts = rawUrl.replace(/^https?:\/\//, '').split('/').filter(Boolean);
-  if (parts.length >= 2 && !parts[0].includes('.')) return parts[0] + '/' + parts[1];
   return null;
 }
 
-async function fetchWithProxy(url) {
+async function fetchWithProxy(url, signal) {
   for (const makeProxy of PROXIES) {
     try {
       const proxyUrl = makeProxy(url);
-      const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(15000)])
+        : AbortSignal.timeout(15000);
+      const res = await fetch(proxyUrl, { signal: combinedSignal });
       if (res.ok) {
         const text = await res.text();
-        if (text && text.length > 100) return text;
+        // Require __NEXT_DATA__ to confirm we got a real DeepWiki page, not a proxy error page
+        if (text && text.length > 100 && text.includes('__NEXT_DATA__')) return text;
       }
-    } catch (_) { /* try next */ }
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      /* try next */
+    }
   }
   throw new Error(`All proxies failed for: ${url}`);
 }
@@ -370,6 +378,9 @@ async function startFetch() {
   reset();
   hideError();
 
+  currentAbortController = new AbortController();
+  const signal = currentAbortController.signal;
+
   const rawUrl = document.getElementById('url-input').value;
   const repo = parseRepoFromUrl(rawUrl);
 
@@ -380,6 +391,7 @@ async function startFetch() {
 
   repoLabel = repo;
   document.getElementById('fetch-btn').disabled = true;
+  document.getElementById('cancel-btn').style.display = 'inline-block';
   document.getElementById('progress-area').style.display = 'flex';
   setProgress(5, 'Fetching index page…');
 
@@ -387,10 +399,12 @@ async function startFetch() {
 
   let indexHtml;
   try {
-    indexHtml = await fetchWithProxy(baseUrl);
+    indexHtml = await fetchWithProxy(baseUrl, signal);
   } catch (e) {
-    showError('Could not fetch DeepWiki page. The repo may not be indexed, or all CORS proxies are unavailable. Try again in a moment.');
+    document.getElementById('cancel-btn').style.display = 'none';
     document.getElementById('fetch-btn').disabled = false;
+    if (e.name === 'AbortError') { showError('Export cancelled.'); return; }
+    showError('Could not fetch DeepWiki page. The repo may not be indexed, or all CORS proxies are unavailable. Try again in a moment.');
     return;
   }
 
@@ -403,8 +417,9 @@ async function startFetch() {
   });
 
   if (slugs.length === 0 && !indexContent) {
-    showError('Could not find any wiki pages. The repo might not be indexed on DeepWiki, or the page structure changed.');
+    document.getElementById('cancel-btn').style.display = 'none';
     document.getElementById('fetch-btn').disabled = false;
+    showError('Could not find any wiki pages. The repo might not be indexed on DeepWiki, or the page structure changed.');
     return;
   }
 
@@ -426,12 +441,14 @@ async function startFetch() {
   let done = 0, errors = 0;
 
   for (const slug of slugs) {
+    if (signal.aborted) break;
+
     const id = slug.replace(/[^a-z0-9]/gi, '-');
     addPageItem(slug, id);
     const pageUrl = `https://deepwiki.com/${repo}/${slug}`;
 
     try {
-      const html = await fetchWithProxy(pageUrl);
+      const html = await fetchWithProxy(pageUrl, signal);
       const content = extractPageMarkdown(html, slug);
 
       if (content && content.length > 30) {
@@ -446,20 +463,31 @@ async function startFetch() {
           updatePageItem(id, 'error');
           done++;
           setProgress(10 + (done / slugs.length) * 85, 'Fetching pages…', `${done} / ${slugs.length}`);
+          await new Promise(r => setTimeout(r, 150));
           continue;
         }
       }
 
       updatePageItem(id, 'done');
     } catch (e) {
+      if (e.name === 'AbortError') break;
       errors++;
-      parts.push(`# ${slug}\n\n*(Failed to fetch: ${e.message})*\n\n---\n\n`);
+      parts.push(`# ${slug}\n\n*(Failed to fetch page)*\n\n---\n\n`);
       updatePageItem(id, 'error');
     }
 
     done++;
     setProgress(10 + (done / slugs.length) * 85, 'Fetching pages…', `${done} / ${slugs.length}`);
     await new Promise(r => setTimeout(r, 150));
+  }
+
+  document.getElementById('cancel-btn').style.display = 'none';
+  currentAbortController = null;
+
+  if (signal.aborted) {
+    showError('Export cancelled.');
+    document.getElementById('fetch-btn').disabled = false;
+    return;
   }
 
   collectedMarkdown = parts.join('');
@@ -470,6 +498,10 @@ async function startFetch() {
   document.getElementById('stat-size').textContent = kb;
   document.getElementById('stat-errors').textContent = errors;
   document.getElementById('result-area').style.display = 'flex';
+}
+
+function cancelFetch() {
+  if (currentAbortController) currentAbortController.abort();
 }
 
 function downloadMarkdown() {
