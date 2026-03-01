@@ -215,8 +215,7 @@ async function fetchWithProxy(url, signal) {
       const res = await fetch(proxyUrl, { signal: combinedSignal });
       if (res.ok) {
         const text = await res.text();
-        // Require __NEXT_DATA__ to confirm we got a real DeepWiki page, not a proxy error page
-        if (text && text.length > 100 && text.includes('__NEXT_DATA__')) return text;
+        if (text && text.length > 100) return text;
       }
     } catch (e) {
       if (e.name === 'AbortError') throw e;
