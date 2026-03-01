@@ -12,7 +12,7 @@ A single-page tool that exports any [DeepWiki](https://deepwiki.com) repository 
 
 ## How it works
 
-DeepWiki pages are server-rendered Next.js pages. The tool fetches each page via a public CORS proxy, extracts the structured content from the embedded `__NEXT_DATA__` JSON, and concatenates all pages into one Markdown document.
+DeepWiki is a Next.js App Router site. When you request any page, the server embeds the full wiki content in the HTML as RSC (React Server Components) flight data — a series of `self.__next_f.push([1, "..."])` script tags. The tool fetches the index page once via a public CORS proxy, reconstructs the RSC stream, extracts all `T<hex-length>,<content>` text chunks, and concatenates them into one Markdown document. No individual page requests needed.
 
 ## Security note
 
