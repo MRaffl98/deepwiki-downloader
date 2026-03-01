@@ -1,0 +1,16 @@
+name: DeepWiki Health Check
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC
+  workflow_dispatch:      # Allow manual runs from the Actions tab
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run extraction health check
+        run: python3 .github/scripts/health_check.py
