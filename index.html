@@ -248,10 +248,10 @@ function extractRscSections(html) {
 
   // Extract T<length>, text chunks and keep those that are markdown sections
   const sections = [];
-  const re = /\w+:T(\d+),/g;
+  const re = /\w+:T([0-9a-fA-F]+),/g;
   let match;
   while ((match = re.exec(rsc)) !== null) {
-    const len = parseInt(match[1]);
+    const len = parseInt(match[1], 16); // RSC chunk lengths are hex
     const text = rsc.slice(match.index + match[0].length, match.index + match[0].length + len);
     if (text.trimStart().startsWith('#')) sections.push(text.trim());
   }
