@@ -169,9 +169,8 @@
 <script>
 // NOTE: For a production environment, replace these with your own trusted backend proxy.
 const PROXIES = [
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
   url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  url => `https://cors-anywhere.herokuapp.com/${url}`,
 ];
 
 let collectedMarkdown = '';
@@ -210,134 +209,53 @@ async function fetchWithProxy(url, signal) {
     try {
       const proxyUrl = makeProxy(url);
       const combinedSignal = signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(15000)])
-        : AbortSignal.timeout(15000);
+        ? AbortSignal.any([signal, AbortSignal.timeout(20000)])
+        : AbortSignal.timeout(20000);
       const res = await fetch(proxyUrl, { signal: combinedSignal });
       if (res.ok) {
         const text = await res.text();
-        if (text && text.length > 100) return text;
+        // Confirm we got a real Next.js App Router page, not a proxy error page
+        if (text && text.length > 100 && text.includes('__next_f')) return text;
       }
     } catch (e) {
       if (e.name === 'AbortError') throw e;
       /* try next */
     }
   }
-  throw new Error(`All proxies failed for: ${url}`);
+  throw new Error('All proxies failed');
 }
 
-function extractNextData(html) {
-  try {
-    // SECURITY FIX: Using DOMParser avoids regex ReDoS and parse errors
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-    const scriptTag = doc.getElementById('__NEXT_DATA__');
-    if (scriptTag && scriptTag.textContent) {
-      return JSON.parse(scriptTag.textContent);
+function extractRscSections(html) {
+  // DeepWiki uses Next.js App Router. All page content is embedded in the
+  // initial HTML as RSC (React Server Components) flight data via
+  // self.__next_f.push([1, "<rsc-stream>"]) script tags.
+  // Text chunks in the RSC stream have the format: <id>:T<byte-length>,<raw content>
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // Reconstruct the full RSC stream by decoding each push payload
+  let rsc = '';
+  doc.querySelectorAll('script').forEach(script => {
+    const src = script.textContent || '';
+    if (!src.includes('__next_f.push')) return;
+    const m = src.match(/self\.__next_f\.push\(\[1,([\s\S]*)\]\)/);
+    if (m) {
+      try { rsc += JSON.parse(m[1]); } catch (_) {}
     }
-  } catch (e) {
-    return null;
+  });
+
+  if (!rsc) return [];
+
+  // Extract T<length>, text chunks and keep those that are markdown sections
+  const sections = [];
+  const re = /\w+:T(\d+),/g;
+  let match;
+  while ((match = re.exec(rsc)) !== null) {
+    const len = parseInt(match[1]);
+    const text = rsc.slice(match.index + match[0].length, match.index + match[0].length + len);
+    if (text.trimStart().startsWith('#')) sections.push(text.trim());
   }
-  return null;
-}
-
-function extractPageMarkdown(html, slug) {
-  const data = extractNextData(html);
-  if (!data) return null;
-
-  const props = data?.props?.pageProps;
-  if (!props) return null;
-
-  const tryPaths = [
-    props?.wikiPage?.content,
-    props?.page?.content,
-    props?.content,
-    props?.wikiData?.pages?.find?.(p => p.slug === slug)?.content,
-    props?.wikiContent,
-  ];
-
-  for (const candidate of tryPaths) {
-    if (typeof candidate === 'string' && candidate.length > 20) {
-      return candidate;
-    }
-  }
-
-  function findMarkdown(obj, depth = 0) {
-    if (depth > 6) return null;
-    if (typeof obj === 'string' && obj.length > 200 && obj.includes('\n')) return obj;
-    if (Array.isArray(obj)) {
-      for (const v of obj) { const r = findMarkdown(v, depth+1); if (r) return r; }
-    }
-    if (obj && typeof obj === 'object') {
-      for (const k of Object.keys(obj)) {
-        if (['__N_SSP', 'query', 'buildId', 'isFallback', 'customServer', 'gsp'].includes(k)) continue;
-        const r = findMarkdown(obj[k], depth+1);
-        if (r) return r;
-      }
-    }
-    return null;
-  }
-
-  return findMarkdown(props);
-}
-
-function extractSlugs(html) {
-  const data = extractNextData(html);
-  const slugs = new Set();
-
-  if (data && data.props && data.props.pageProps) {
-    function collectSlugs(obj, depth = 0) {
-      if (depth > 8 || !obj) return;
-      if (typeof obj === 'string') {
-        if (/^[\d]+-[a-z]/.test(obj) && obj.length < 80) slugs.add(obj);
-        return;
-      }
-      if (Array.isArray(obj)) {
-        obj.forEach(v => collectSlugs(v, depth+1));
-        return;
-      }
-      if (typeof obj === 'object') {
-        for (const k of ['slug', 'id', 'path', 'href', 'url', 'link', 'pages', 'children', 'items', 'sections', 'toc', 'nav']) {
-          if (obj[k] !== undefined) collectSlugs(obj[k], depth+1);
-        }
-      }
-    }
-    collectSlugs(data.props.pageProps);
-  }
-
-  // SECURITY FIX: Safely parse HTML looking for links instead of using global regex matchers
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-    const links = doc.querySelectorAll('a[href]');
-    links.forEach(a => {
-      const href = a.getAttribute('href');
-      if (href) {
-        const m = href.match(/\/([\d]+-[a-z][a-z0-9-]*)$/i);
-        if (m) slugs.add(m[1]);
-      }
-    });
-  } catch (e) {
-    // Ignore parsing errors
-  }
-
-  return [...slugs].filter(s => /^\d+/.test(s));
-}
-
-function htmlToMarkdown(html) {
-  // SECURITY FIX: Use DOMParser to strip tags safely instead of a weak regex
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
-
-    // Remove potentially malicious or styling nodes completely
-    const scripts = doc.querySelectorAll('script, style, iframe, object, embed');
-    scripts.forEach(s => s.remove());
-
-    const text = doc.body ? doc.body.textContent : doc.documentElement.textContent;
-    return text.replace(/\n{3,}/g, '\n\n').trim();
-  } catch (e) {
-    return "*(Failed to safely parse HTML content)*";
-  }
+  return sections;
 }
 
 function setProgress(pct, text, count) {
@@ -346,31 +264,17 @@ function setProgress(pct, text, count) {
   if (count !== undefined) document.getElementById('progress-count').textContent = count;
 }
 
-function addPageItem(slug, id) {
+function addSectionItem(title) {
   const list = document.getElementById('pages-list');
-
-  // SECURITY FIX: Create elements securely to prevent DOM-based XSS
   const el = document.createElement('div');
-  el.className = 'page-item active';
-  el.id = 'pi-' + id;
-
+  el.className = 'page-item done';
   const dot = document.createElement('div');
   dot.className = 'status-dot';
-
-  const textSpan = document.createElement('span');
-  textSpan.textContent = slug; // .textContent safely escapes the string
-
+  const span = document.createElement('span');
+  span.textContent = title;
   el.appendChild(dot);
-  el.appendChild(textSpan);
+  el.appendChild(span);
   list.appendChild(el);
-
-  el.scrollIntoView({ block: 'nearest' });
-  return el;
-}
-
-function updatePageItem(id, status) {
-  const el = document.getElementById('pi-' + id);
-  if (el) el.className = 'page-item ' + status;
 }
 
 async function startFetch() {
@@ -392,13 +296,13 @@ async function startFetch() {
   document.getElementById('fetch-btn').disabled = true;
   document.getElementById('cancel-btn').style.display = 'inline-block';
   document.getElementById('progress-area').style.display = 'flex';
-  setProgress(5, 'Fetching index page…');
+  setProgress(5, 'Fetching wiki…');
 
   const baseUrl = `https://deepwiki.com/${repo}`;
 
-  let indexHtml;
+  let html;
   try {
-    indexHtml = await fetchWithProxy(baseUrl, signal);
+    html = await fetchWithProxy(baseUrl, signal);
   } catch (e) {
     document.getElementById('cancel-btn').style.display = 'none';
     document.getElementById('fetch-btn').disabled = false;
@@ -407,95 +311,31 @@ async function startFetch() {
     return;
   }
 
-  let slugs = extractSlugs(indexHtml);
-  const indexContent = extractPageMarkdown(indexHtml, 'index') || extractPageMarkdown(indexHtml, '');
+  setProgress(50, 'Extracting content…');
+  const sections = extractRscSections(html);
 
-  slugs = [...new Set(slugs)].sort((a, b) => {
-    const na = parseFloat(a), nb = parseFloat(b);
-    return na - nb;
-  });
-
-  if (slugs.length === 0 && !indexContent) {
+  if (sections.length === 0) {
     document.getElementById('cancel-btn').style.display = 'none';
     document.getElementById('fetch-btn').disabled = false;
-    showError('Could not find any wiki pages. The repo might not be indexed on DeepWiki, or the page structure changed.');
+    showError('Could not extract wiki content. The repo might not be indexed on DeepWiki, or the page structure has changed.');
     return;
   }
 
-  setProgress(10, `Found ${slugs.length} page(s). Fetching content…`, `0 / ${slugs.length}`);
+  setProgress(90, 'Building document…', `${sections.length} sections`);
+  sections.forEach(s => addSectionItem(s.split('\n')[0].replace(/^#+\s*/, '')));
 
-  const parts = [];
-  const header = `# ${repo} — DeepWiki Export\n\n> Source: ${baseUrl}\n> Generated: ${new Date().toISOString()}\n> Pages: ${slugs.length + 1}\n\n---\n\n`;
-  parts.push(header);
+  const header = `# ${repo} — DeepWiki Export\n\n> Source: ${baseUrl}\n> Generated: ${new Date().toISOString()}\n> Sections: ${sections.length}\n\n---\n\n`;
+  collectedMarkdown = header + sections.join('\n\n---\n\n');
 
-  if (indexContent) {
-    parts.push(`# Overview\n\n${indexContent.trim()}\n\n---\n\n`);
-  } else {
-    const fallback = htmlToMarkdown(indexHtml);
-    if (fallback.length > 200) {
-      parts.push(`# Overview\n\n${fallback.substring(0, 4000)}\n\n---\n\n`);
-    }
-  }
-
-  let done = 0, errors = 0;
-
-  for (const slug of slugs) {
-    if (signal.aborted) break;
-
-    const id = slug.replace(/[^a-z0-9]/gi, '-');
-    addPageItem(slug, id);
-    const pageUrl = `https://deepwiki.com/${repo}/${slug}`;
-
-    try {
-      const html = await fetchWithProxy(pageUrl, signal);
-      const content = extractPageMarkdown(html, slug);
-
-      if (content && content.length > 30) {
-        parts.push(`# ${slug}\n\n${content.trim()}\n\n---\n\n`);
-      } else {
-        const fallback = htmlToMarkdown(html);
-        if (fallback.length > 100) {
-          parts.push(`# ${slug}\n\n${fallback.substring(0, 6000)}\n\n---\n\n`);
-        } else {
-          errors++;
-          parts.push(`# ${slug}\n\n*(Content could not be extracted)*\n\n---\n\n`);
-          updatePageItem(id, 'error');
-          done++;
-          setProgress(10 + (done / slugs.length) * 85, 'Fetching pages…', `${done} / ${slugs.length}`);
-          await new Promise(r => setTimeout(r, 150));
-          continue;
-        }
-      }
-
-      updatePageItem(id, 'done');
-    } catch (e) {
-      if (e.name === 'AbortError') break;
-      errors++;
-      parts.push(`# ${slug}\n\n*(Failed to fetch page)*\n\n---\n\n`);
-      updatePageItem(id, 'error');
-    }
-
-    done++;
-    setProgress(10 + (done / slugs.length) * 85, 'Fetching pages…', `${done} / ${slugs.length}`);
-    await new Promise(r => setTimeout(r, 150));
-  }
+  setProgress(100, 'Done!', `${sections.length} sections`);
 
   document.getElementById('cancel-btn').style.display = 'none';
   currentAbortController = null;
 
-  if (signal.aborted) {
-    showError('Export cancelled.');
-    document.getElementById('fetch-btn').disabled = false;
-    return;
-  }
-
-  collectedMarkdown = parts.join('');
-  setProgress(100, 'Done!', `${done} / ${slugs.length}`);
-
   const kb = Math.round(collectedMarkdown.length / 1024);
-  document.getElementById('stat-pages').textContent = done + 1;
+  document.getElementById('stat-pages').textContent = sections.length;
   document.getElementById('stat-size').textContent = kb;
-  document.getElementById('stat-errors').textContent = errors;
+  document.getElementById('stat-errors').textContent = 0;
   document.getElementById('result-area').style.display = 'flex';
 }
 
@@ -505,7 +345,6 @@ function cancelFetch() {
 
 function downloadMarkdown() {
   if (!collectedMarkdown) return;
-  // SECURITY FIX: Strip characters that might break file saving on some OS's
   const safeLabel = repoLabel.replace(/[^a-z0-9-]/gi, '_');
   const filename = safeLabel + '_deepwiki.md';
   const blob = new Blob([collectedMarkdown], { type: 'text/markdown;charset=utf-8' });
